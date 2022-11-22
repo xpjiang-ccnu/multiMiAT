@@ -1,0 +1,884 @@
+---
+title: "multiMiAT: An optimal microbiome-based association test for multicategory phenotypes"
+author: "Han Sun, Yue Wang, Zhen Xiao, Xiaoyun Huang, Haodong Wang, Tingting He, Xingpeng Jiang"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_vignette:
+    toc: true
+vignette: >
+  %\VignetteIndexEntry{multiMiAT}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+  
+---
+```{r multiMiAT, include = FALSE}
+multiMiAT <- function (y, otu.tab, tree, covs = NULL, method = c("multiMiRKAT", "score", "MiRKAT-MC"), distance = c("BC", "U.UniFrac", "G.UniFrac.00", "G.UniFrac.25", "G.UniFrac.50", "G.UniFrac.75", "W.UniFrac"), kernel = c("LK", "GK", "LaK"), W, CLR = FALSE, n.perm = 999, seed = 1) {
+  
+  if (CLR) {
+    otu.tab <- t(apply(otu.tab, 1, clr))
+  }
+
+  if(class(covs) != "data.frame") {
+    stop("Error: data format of covariates must be data frame!")
+  }
+
+  Ks <- Whole.Kernels(otu.tab, tree, distance = distance, kernel = kernel) 
+  
+  if (!("multiMiRKAT" %in% method) & !("score" %in% method) & !("MiRKAT-MC" %in% method)) {
+    stop("Error: Method must have at least one of multiMiRKAT, score and MiRKAT-MC! Method can also be any two or all of them! Please enter the correct method!")
+  }
+
+  multiMiAT.all <- list()
+  multiMiAT.pvs <- NULL
+  if ("multiMiRKAT" %in% method){
+    re.bcl <- multiMiRKAT_bcl(y = y, Ks = Ks, covs = covs, n.perm = n.perm, seed = seed)
+    re.clm <- multiMiRKAT_clm(y = y, Ks = Ks, covs = covs, n.perm = n.perm, seed = seed)
+    multiMiRKAT.pvs <- c(list(multiMiRKAT.bcl.pvs = re.bcl$multiMiRKAT.bcl.pvs), list(multiMiRKAT.clm.pvs = re.clm$multiMiRKAT.clm.pvs))
+    multiMiRKAT <- c(re.bcl$multiMiRKAT.bcl.Omnibus.p["multiMiRKAT-N"], re.clm$multiMiRKAT.clm.Omnibus.p["multiMiRKAT-O"])
+    names(multiMiRKAT.pvs) <- c("multiMiRKAT.bcl.pvs", "multiMiRKAT.clm.pvs")
+    names(multiMiRKAT) <- c("multiMiRKAT-N", "multiMiRKAT-O")
+    multiMiAT.all <- c(multiMiAT.all, list(multiMiRKAT.pvs))
+    names(multiMiAT.all)[length(multiMiAT.all)] <- "multiMiRKAT.pvs"
+    multiMiAT.pvs <- c(multiMiAT.pvs, multiMiRKAT)
+  }
+
+  if ("score" %in% method){
+    score.test <- as.numeric(round(score.test_bcl(y, otu.tab, covs, W), digits = 4))
+    names(score.test) <- "score test"
+    multiMiAT.pvs <- c(multiMiAT.pvs, score.test)
+  }
+  
+  if ("MiRKAT-MC" %in% method){
+    MiRKATMC.bcl <- MiRKAT_MCN(y, Ks, covs = covs)
+    MiRKATMC.clm <- MiRKAT_MCO(y, Ks, covs = covs)
+    MiRKAT.MC <- c(round(MiRKATMC.bcl$MiRKAT_MCN, digits = 4), round(MiRKATMC.clm$MiRKAT_MCO, digits = 4))
+    names(MiRKAT.MC) <- c("MiRKAT-MCN", "MiRKAT-MCO")
+    multiMiAT.pvs <- c(multiMiAT.pvs, MiRKAT.MC)
+  }
+  
+  multiMiAT.pvs[which(multiMiAT.pvs == 0)] <- 1e-6
+  if (length(method) == 1){
+    if (method != "score") {
+      multiMiAT.pvs <- c(multiMiAT.pvs, round(harmonicmeanp::p.hmp(p = multiMiAT.pvs, w = NULL, L = length(multiMiAT.pvs), w.sum.tolerance = 1e-6, multilevel = F)[1], digits = 4))
+      names(multiMiAT.pvs)[length(multiMiAT.pvs)] <- method
+    }
+    multiMiAT.all <- c(multiMiAT.all, list(multiMiAT.pvs))
+    names(multiMiAT.all)[length(multiMiAT.all)] <- "Combined.methods.pvs"
+  } else {
+    multiMiAT.omni <- round(harmonicmeanp::p.hmp(p = multiMiAT.pvs, w = NULL, L = length(multiMiAT.pvs), w.sum.tolerance = 1e-6, multilevel = F)[1], digits = 4)
+    if (length(method) == 2) {
+      names(multiMiAT.omni) <- paste(method[1], "+", method[2], sep = "")
+    } else {
+      names(multiMiAT.omni) <- "multiMiAT"
+    }
+    multiMiAT.all <- c(multiMiAT.all, list(multiMiAT.pvs), list(multiMiAT.omni))    
+    names(multiMiAT.all)[(length(multiMiAT.all)-1):length(multiMiAT.all)] <- c("Combined.methods.pvs", "Optimal.test.p") 
+  }
+
+  return(multiMiAT = multiMiAT.all)
+}
+```
+
+
+
+# 1. Introduction
+
+This R package, **multiMiAT**, can be used for testing the association between microbiome and multicategory phenotypes.  Specifically, **multiMiAT** can be applied to not only ordinal multicategory phenotypes (i.e., disease severity), but also nominal multicategory phenotypes (i.e., tumor subtype or dietary pattern). Considering that the binary outcome is a special case of the multicategory outcomes, our method can also be used for binary outcomes.
+
+
+
+# 2. Installation
+
+## 2.1. Requisite R packages
+
+Our R package multiMiAT requires these existing R packages ("phyloseq", "ecodist", "GUniFrac", "permute", "ape", "VGAM", "MASS", "Matrix", "dirmult", "harmonicmeanp", "devtools", "MiHC") to be pre-imported, where "phyloseq" is available in Bioconductor, "ecodist", "GUniFrac", "permute", "ape", "VGAM", "MASS", "Matrix", "dirmult", "harmonicmeanp", "devtools" are available in CRAN, and "MiHC" is available in github. We need to install these package using the following code:
+
+```
+BiocManager::install("phyloseq")
+install.packages("ecodist")
+install.packages("GUniFrac")
+install.packages("permute")
+install.packages("ape")
+install.packages("VGAM")
+install.packages("MASS")
+install.packages("Matrix")
+install.packages("dirmult")
+install.packages("harmonicmeanp")
+install.packages("devtools")
+devtools::install_github("hk1785/MiHC")
+```
+
+
+## 2.2. R package **multiMiAT**
+
+You may install `multiMiAT` from GitHub using the following code: 
+```
+devtools::install_github("xpjiang-ccnu/multiMiAT", force=T)
+```
+
+
+
+# 3. Model
+
+## 3.1. Multinomial logit models
+
+For the observation value of the $i$th subject, we record the multinomial response variable $y_{i} \in \{1, 2, \ldots, J\}$, where $i = 1, 2, \ldots, n$ and $J$ > 2. We suppose $Y_{ij} = \text{I}\ (y_{i} = j)$, where $\text{I}\ (\cdot)$ is indicator function and $j = 1, \ldots, J-1$, and define $\textbf{Y}_{i} = (Y_{i1}, \ldots, Y_{i(J-1)})^T$ as response vector. We also observe $m$ OTUs abundance $\textbf{o}_{i} = (o_{i1}, o_{i2}, \ldots, o_{im})^T$ and $t$ covariate $\textbf{x}_{i} = (x_{i1}, \ldots, x_{it})^T$. We assume that the marginal expectation of $Y_{ij}$ given $\textbf{x}_{i},\textbf{o}_{i}$ is $\mu_{ij}:= E(Y_{ij}|\textbf{x}_{i},\textbf{o}_{i}) = P(y_{i} = j|\textbf{x}_{i},\textbf{o}_{i})$, we connect the marginal expected vector and covariates by specifying that
+
+\begin{equation}
+    g(\mu_{ij}) = \alpha_{0j} + \textbf{x}_{i}^T {\alpha} + f({\textbf{o}}_{i}),\label{logit}
+\end{equation}
+where $\alpha_{0j}$ and $\alpha$ are the intercept and regression coefficients, respectively. $g(\cdot)$ is a link function. $f(\cdot)$ is a function reflecting the microbiome profile. We consider the cumulative link model (clm, also called the proportional odds model) and baseline category logit model (bcl) as the link function, respectively, whose forms are as follows:
+\begin{equation}
+    \text{log}(\frac{P(y_{i} \leq j| \textbf{x}_{i}, \textbf{o}_{i})}{1-P(y_{i} \leq j| \textbf{x}_{i}, \textbf{o}_{i})}) = \alpha_{0j} + \textbf{x}_{i}^T \alpha_{\ast} + f({\textbf{o}}_{i}),\label{clm1}
+\end{equation}
+\begin{equation}
+    \text{log}(\frac{\mu_{ij}}{\mu_{iJ}}) = \alpha_{0j} + \textbf{x}_{i}^T \alpha_{j} + f({\textbf{o}}_{i}).\label{bcl1}
+\end{equation}
+Here, the regression coefficients $\alpha_{\ast}$ are fixed for all $j$. $\alpha_{0j}$ is the category-specific intercept and needs to satisfy a monotonicity constraint (i.e., $\alpha_{01} \leq \ldots \leq \alpha_{0(J-1)}$) only in the cumulative link model. $\alpha_{j}$ is the category-specific regression coefficient. 
+
+
+## 3.2. Microbiome regression-based kernel association test for multicategory phenotypes (multiMiRKAT)
+
+### 3.2.1. Microbiome regression-based kernel individual tests
+
+We adopt seven types of distances to calculate the dissimilarity matrix between subjects. Specifically, Bray-Curtis dissimilarity ($\text{D}_{\text{BC}}$), as a non-phylogeny-based dissimilarity, and the unweighted and weighted UniFrac ($\text{D}_{\text{u}}$ and $\text{D}_{\text{w}}$), as the phylogeny-based distance, are taken into account, which are also commonly used in microbial research. Considering weight assignments, we adopt the four generalized UniFrac with $\alpha$ = 0, 0.25, 0.5, and 0.75 ($\text{D}_{\text{0}}$, $\text{D}_{\text{0.25}}$, $\text{D}_{\text{0.5}}$ and $\text{D}_{\text{0.75}}$). We convert the distance matrix into a kernel matrix via a kernel function. Here, we consider taking linear and nonlinear kernel functions into our model, whose models are as follows:
+
+$\textbf{Linear kernel} (\text{K}_{\text{LK}}): \textbf{K}_{d} = - \frac{1}{2} (\textbf{I}_n - \frac {\textbf{1}_n \textbf{1}^T_n}{n}) \textbf{D}_d^2 (\textbf{I}_n - \frac {\textbf{1}_n \textbf{1}^T_n}{n}),$
+
+$\textbf{Gaussian kernel} (\text{K}_{\text{GK}}): \textbf{K} = \text{exp} (- \frac{\textbf{D}_{d}^2}{2 \sigma^2}),$
+
+$\textbf{Laplacian kernel} (\text{K}_{\text{LaK}}): \textbf{K} = \text{exp} (- \frac{\textbf{D}_{d}}{\sigma}),$
+
+where $\textbf{I}_n$ is a $n \times n$ identity matrix. $\textbf{1}_n$ is a $n$-dimensional vector of ones. $\textbf{D}_{d}$ is dissimilarity matrix and $d \in \Gamma_{\text{D}} = \{\text{D}_{\text{BC}}, \text{D}_{\text{u}}, \text{D}_{\text{0}}, \text{D}_{\text{0.25}},$ $\text{D}_{\text{0.5}}, \text{D}_{\text{0.75}}, \text{D}_{\text{w}}\}$. $\sigma$ is the hyperparameter. We also conduct the positive semi-definiteness correction procedure for $\textbf{K}$ to ensure that the eigenvalue of $\textbf{K}$ is non-negative. We calculate the eigenvalues $\lambda_i$ ($i = 1, \ldots,  n$) and eigenvectors of $\textbf{K}$ via eigenvalue decomposition $\textbf{K} = \textbf{U} {\Lambda} \textbf{U}^T$, where ${\Lambda}$ is the diagonal matrix with the $i$th diagonal element $\lambda_i$. Then, we obtain the reconstructed kernel matrix $\textbf{K}^* = \textbf{U} \Lambda^* \textbf{U}^T$, where $\Lambda^*$ is the diagonal matrix with the $i$th diagonal element $\left | \lambda_i  \right |$.
+
+We define $\textbf{Y} = (\textbf{Y}_{1}^T, \ldots \textbf{Y}_{n}^T)^T$ and the test statistic of individual tests are
+\begin{equation}
+    T_l^{kd} = (\textbf{Y} - \hat{{\mu}}_l)^T \textbf{V}^{-1}_{l} {\widetilde{\textbf{K}}}_{kd} \textbf{V}^{-1}_{l} (\textbf{Y} - \hat{{\mu}}_l),
+\end{equation}
+where $\hat{{\mu}}_l = (\hat{\mu}_l^{11}, \ldots, \hat{\mu}_l^{1(J-1)}, \ldots, \hat{\mu}_l^{n1}, \ldots, \mu_l^{n(J-1)})^T$. $\hat{{\mu}}_l$ is the the estimated expectation via multinomial logit model under $H_0$ condition, where $l \in \Gamma_{\text{L}} = \{\text{M}_\text{bcl}, \text{M}_\text{clm}\}$. $\textbf{V}_{l} = \textbf{I}_n \otimes \textbf{V}_{l0}$ and $\textbf{V}_{l0}$ is the estimated residual variance matrix under the null model. ${\widetilde{\textbf{K}}_{kd}} = \textbf{K}^*_{kd} \otimes \textbf{1}_{(J-1) \times (J-1)}$, where $\textbf{1}_{(J-1) \times (J-1)}$ is $(J-1) \times (J-1)$ matrix of ones, $k \in \Gamma_{\text{K}} = \{\text{K}_{\text{LK}}, \text{K}_{\text{GK}}, \text{K}_{\text{LaK}}\}$. 
+
+
+### 3.2.2. Microbiome regression-based kernel omnibus tests
+
+We take the minimum $p$-values of individual tests as the test statistics of global omnibus tests
+\begin{equation}
+    T_{\text{multiMiRKAT}} = \underset{k \in \Gamma_{\text{K}}}{\text{min}} \underset{d \in \Gamma_{\text{D}}}{\text{min}} p_l^{kd}.
+\end{equation}
+where $p_l^{kd}$ denotes the $p$-value of $T_l^{kd}$. Considering that the regression parameter coefficients fitted ordinal/nominal multinomial logit model may be inconsistent, we adopt two multinomial logit models (i.e., clm and bcl) to model the global omnibus tests $T_{\text{multiMiRKAT}}$. Specifically, we recommend using clm/bcl to construct the test statistic of global omnibus test for ordinal/nominal multinomial outcomes, respectively. We call the global omnibus test for ordinal or nominal multinomial outcomes multiMiRKAT-O or multiMiRKAT-N. 
+
+
+## 3.3. Score test
+
+We define that $\textbf{O} = (\textbf{o}_{1}, \ldots, \textbf{o}_{n})^T$ and $\textbf{W}$ is a $m$-dimensional weight vector which represents the weights of $m$ OTUs. Let $\textbf{S} = \textbf{I}_{(J-1)} \otimes (\textbf{OW}^T)$, where $\textbf{I}_{(J-1)}$ represents a $(J-1) \times (J-1)$ identity matrix and $\otimes$ is the Kronecker product. Here, we adopt $\textbf{W} = \textbf{1}_m$ and $\textbf{1}_m$ is a $m$-dimensional vector of ones. Let $\overline{\textbf{Y}}_{j} = (Y_{1j}, \ldots, Y_{nj})^T$ and $\overline{\textbf{Y}} = (\overline{\textbf{Y}}_{1}^T, \ldots, \overline{\textbf{Y}}_{m}^T)^T$. The covariance matrix of $\overline{\textbf{Y}}$ is 
+\begin{equation}
+{\Sigma} = \begin{pmatrix}
+
+    {\Sigma}_{1,1} & \cdots & {\Sigma}_{1, J - 1} \\
+    
+    \vdots & \ddots & \vdots \\
+    
+    {\Sigma}_{J - 1, 1} & \cdots & {\Sigma}_{J - 1, J - 1}
+    
+\end{pmatrix},
+\end{equation}
+where 
+\begin{equation}
+  {\Sigma}_{j,j'} = \left\{
+    \begin{aligned}
+        \text{diag}({\mu}_{1j}(1-{\mu}_{1j}), \ldots, {\mu}_{nj}(1-{\mu}_{nj}))  &\qquad \text{if} \quad j = j' \\
+        \text{diag}(- {\mu}_{1j}{\mu}_{1j'}, \ldots, - {\mu}_{nj}{\mu}_{nj'}) \quad &\qquad \text{if} \quad j \neq j'
+    \end{aligned}
+\right..
+\end{equation}
+We define $\overline{{\mu}} = (\overline{{\mu}}_{1}^T, \ldots, \overline{{\mu}}_{m}^T)^T$ and $\textbf{U} = \textbf{S}^T (\overline{\textbf{Y}} - \overline{{\mu}})$, where $\overline{{\mu}}_{j} = (\mu_{1j}, \ldots, \mu_{nj})^T$. Let $\textbf{X} = (\textbf{x}_{1}, \ldots, \textbf{x}_{n})^T$ and $\mathbb{X} = \textbf{I}_{(J-1)} \otimes \textbf{X}$. Then we establish test statistic of score test
+\begin{equation}
+    T_{\text{score}} = \textbf{U}^T \widehat{{\Sigma}}^{-1} \textbf{U}
+\end{equation}
+where $\widehat{{\Sigma}} = \textbf{S}^T ({\Sigma} - {\Sigma} \mathbb{X} (\mathbb{X}^T {\Sigma} \mathbb{X})^{-1} \mathbb{X}^T {\Sigma}) \textbf{S})$ is the covariance matrix of $\textbf{U}$. $T_{\text{score}}$ can be shown to asymptotically follow a $\chi^2$ distribution with degree of freedom $(J - 1)$.
+
+
+## 3.4. MiRKAT-MC
+
+MiRKAT-MC is proposed for multicategory phenotypes. Similar to the OMiRKAT and all its extensions, MiRKAT-MC also utilizes the $p$-value combination method (i.e., HMP) to integrate individual tests. Here, the test statistic of individual tests is
+
+\begin{equation}
+    Q_l^{kd} = (\overline{\textbf{Y}} - \overline{\mu}_l)^T \textbf{H}_l^T \overline{\textbf{W}}_l \thinspace {\overline{\textbf{K}}}_{kd} \overline{\textbf{W}}_l \thinspace \textbf{H}_l (\overline{\textbf{Y}} - \overline{\mu}_l),
+\end{equation}
+where ${\overline{\textbf{K}}}_{kd} = \textbf{I}_{(J-1)} \otimes \textbf{K}^*_{kd}$ and $\overline{\textbf{W}}_l = (\textbf{H}_l \overline{\textbf{V}}_l \textbf{H}_l)^{-1}$. $\textbf{H}_l = \partial (\mathbb{X} \hat{\beta})/\partial \overline{\mu}_l$ and $\overline{\textbf{V}}_l$ is the variance-covariance matrix. MiRKAT-MC test consists of bcl-based MiRKAT-MCN test and clm-based MiRKAT-MCO test.
+
+
+## 3.5. Optimal test for multinomial outcomes
+
+The optimal test multiMiAT adopts HMP to cpmbine the $p$-values of multiMiRKAT test, score test and MiRKAT-MC test, whose test statistic is 
+\begin{equation}
+    T_{\text{multiMiAT}} = \frac{\sum_{t \in \Gamma_\text{T}} w_t} {\sum_{t \in \Gamma_\text{T}} w_t / p_t},
+\end{equation}
+where $w_t$ . $\Gamma_\text{T} = \{T_{\text{multiMiRKAT-N}}, T_{\text{multiMiRKAT-O}}, T_{\text{score}}, T_{\text{MiRKAT-MCN}}, T_{\text{MiRKAT-MCO}}\}$ and $p_t$ represents the $p$-values of these combined tests. Remarkably, the MiRKAT-MC test combined in our method is with more distances and kernel functions compared to the original MiRKAT-MC test. Considering the advantages of different association tests, the optimal test multiMiAT can accommodate diverse association patterns.
+
+
+
+# 4. Implementation
+
+**First of all, we import requisite R packages:**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Then, we import example microbiome data:**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+W <- matrix(1, nrow = 1, ncol = ncol(otu.tab))
+```
+**The microbiome data we use includes OTU count table, phylogenetic tree and sample information, where sample information contains response variable (e.g., disease status) and covariates (e.g., age, gender). Next, we test the association between CRC status and microbial composition using multiMiAT:**
+```
+out <- multiMiAT(y = y, otu.tab = otu.tab, tree = tree, covs = covs, method = c("multiMiRKAT", "score", "MiRKAT-MC"), distance = c("BC", "U.UniFrac", "G.UniFrac.00", "G.UniFrac.25", "G.UniFrac.50", "G.UniFrac.75", "W.UniFrac"), kernel = c("LK", "GK", "LaK"), W = W)
+out
+```
+```
+## $multiMiRKAT.pvs
+## $multiMiRKAT.pvs$multiMiRKAT.bcl.pvs
+## $multiMiRKAT.pvs$multiMiRKAT.bcl.pvs$LK
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.0761       0.0060       0.0581       0.1211       0.2352       0.3003 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.2643       0.0230 
+## 
+## $multiMiRKAT.pvs$multiMiRKAT.bcl.pvs$GK.sigma1
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.0871       0.0070       0.0601       0.1291       0.2543       0.3283 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.2993       0.0270 
+## 
+## $multiMiRKAT.pvs$multiMiRKAT.bcl.pvs$LaK.sigma1
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.1221       0.0080       0.0721       0.1582       0.3844       0.5385 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.5906       0.0270 
+## 
+## 
+## $multiMiRKAT.pvs$multiMiRKAT.clm.pvs
+## $multiMiRKAT.pvs$multiMiRKAT.clm.pvs$LK
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.0651       0.0010       0.0380       0.0961       0.2142       0.3073 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.3143       0.0050 
+## 
+## $multiMiRKAT.pvs$multiMiRKAT.clm.pvs$GK.sigma1
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.0851       0.0050       0.0511       0.1131       0.2663       0.4364 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.5145       0.0170 
+## 
+## $multiMiRKAT.pvs$multiMiRKAT.clm.pvs$LaK.sigma1
+##           BC    U.UniFrac G.UniFrac.00 G.UniFrac.25 G.UniFrac.50 G.UniFrac.75 
+##       0.1281       0.0070       0.0521       0.1351       0.3684       0.5746 
+##    W.UniFrac  Omni.MiRKAT 
+##       0.7067       0.0240 
+## 
+## 
+## 
+## $Combined.methods.pvs
+## multiMiRKAT-N multiMiRKAT-O    score test    MiRKAT-MCN    MiRKAT-MCO 
+##        0.0290        0.0060        0.0835        0.0401        0.0232 
+## 
+## $Optimal.test.p
+## multiMiAT 
+##    0.0197
+```
+**We can find significant association between CRC status and microbial composition based on multiMiAT (_p_-value = 0.0197 < 0.05).**
+
+
+
+# 5. Other functions 
+
+## 5.1. Function **SimulateOTU**
+
+### 5.1.1. Description
+
+The function, **SimulateOTU**, generates the OTU count table simulated based on the Dirichlet-multinomial model according to real data, which is the same as the **SimulateOTU** function of the package **GEEMiHC**. We first calculate the parameters of the real data, and then generate the simulated data according to the parameters.
+
+
+### 5.1.2. Example
+
+**Parameter estimation:**
+```
+require(phyloseq)
+require(multiMiAT)
+data("phy", package = "MiHC")
+phy.otu.tab <- otu_table(phy)
+# require(dirmult)
+# phy.parameters <- dirmult(phy.otu.tab)
+data("phy.parameters")
+```
+**Generation of microbiome data:**
+```
+otu.tab <- SimulateOTU(phy.otu.tab, nSam = 100, phy.parameters, mu = 1000, size = 25)
+```
+
+
+## 5.2. Function **ordinal.simulated**
+
+### 5.2.1. Description
+
+The function, **ordinal.simulated**, generates the simulated data including OTU count table, ordinal multinomial host phenotype (e.g., disease severity) and confounding factors (e.g., age, gender), which mainly refers to the **rmult.clm** function in R package, **SimCorMultRes**.
+
+
+### 5.2.2. Example
+
+**Parameter settings:**
+```
+sample_size <- 100
+OTU_select <- 30
+betas0 <- c(0.5, 0.5)
+beta <- 1
+```
+**Generation of microbiome data:**
+```
+require(phyloseq)
+require(multiMiAT)
+data("phy", package = "MiHC")
+phy.otu.tab <- otu_table(phy)
+tree <- phy_tree(phy)
+# library(dirmult)
+# phy.parameters <- dirmult(phy.otu.tab)
+data("phy.parameters")
+otu.tab <- SimulateOTU(phy.otu.tab, nSam = 100, phy.parameters, mu = 1000, size = 25)
+```
+**Random selection of OTUs:**
+```
+otu.tab_selection <- otu.tab[, order(apply(otu.tab, 2, sum), decreasing = T)[1:OTU_select]]
+colnames(otu.tab_selection) <- paste("OTU", colnames(otu.tab_selection), sep = "")
+otu.tab_selection <- scale(otu.tab_selection)
+```
+**Generation of covariates and regression parameters:**
+```
+betas1 <- rep(beta, ncol(otu.tab_selection))
+x1 <- rbinom(sample_size, 1, 0.5)
+x2 <- rnorm(sample_size, 0, 1)
+x1 <- scale(x1)
+x2 <- scale(x2)
+xdata <- data.frame(x1, x2, otu.tab_selection)
+beta_coefficients <- c(betas0, betas1)
+xnam <- colnames(xdata)
+xformula <- as.formula(paste("~ ", paste(xnam, collapse= "+")))
+covs <- data.frame(x1, x2)
+covs[,1] <- as.factor(covs$x1) 
+covs[,2] <- as.numeric(covs$x2)
+```
+**Generation of ordinal multinomial outcomes:**
+```
+y <- ordinal.simulated(betas = beta_coefficients, proportion = c(1, 1, 1, 1), xformula = xformula, xdata = xdata, link = "logit") 
+```
+**Data synthesis of simulated data with ordinal multinomial outcome:**
+```
+otu.tab_information <- otu_table(otu.tab, taxa_are_rows = F)
+sample_information <- sample_data(as.data.frame(cbind(y, x1, x2)))
+colnames(sample_information) <- c("y", "x1", "x2")
+rownames(sample_information) <- rownames(otu.tab_information)
+biom <- phyloseq(otu.tab_information, tree, sample_information)
+```
+
+
+## 5.3. Function **nominal.simulated**
+
+### 5.3.1. Description
+
+The function, **nominal.simulated**, generates the simulated data including OTU count table, nominal multinomial host phenotype (e.g., tumor subtype) and confounding factors (e.g., age, gender), which mainly refers to the **rmult.bcl** function in R package, **SimCorMultRes**.
+
+
+### 5.3.2. Example
+
+**Parameter settings:**
+```
+sample_size <- 100
+categories <- 4
+OTU_select <- 30
+betas0 <- c(1, 0.5, 0.5)
+beta <- 1
+```
+**Generation of microbiome data:**
+```
+require(phyloseq)
+require(multiMiAT)
+data("phy", package = "MiHC")
+phy.otu.tab <- otu_table(phy)
+tree <- phy_tree(phy)
+# library(dirmult)
+# phy.parameters <- dirmult(phy.otu.tab)
+data("phy.parameters")
+otu.tab <- SimulateOTU(phy.otu.tab, nSam = 100, phy.parameters, mu = 1000, size = 25)
+```
+**Random selection of OTUs:**
+```
+otu.tab_selection <- otu.tab[, order(apply(otu.tab, 2, sum), decreasing = TRUE)[1:OTU_select]]
+colnames(otu.tab_selection) <- paste("OTU", colnames(otu.tab_selection), sep = "")
+otu.tab_selection <- scale(otu.tab_selection)
+```
+**Generation of covariates and regression parameters:**
+```
+x1 <- rbinom(sample_size, 1, 0.5)
+x2 <- rnorm(sample_size, 0, 1)
+x1 <- scale(x1)
+x2 <- scale(x2)
+xdata <- data.frame(x1, x2, otu.tab_selection)
+beta_coefficients <- c()
+for (i in 1:(categories-1)) {
+  betas1 <- round(runif(ncol(otu.tab_selection), 0.1, beta), digits = 1)
+  beta_coefficients <- c(beta_coefficients, betas0, betas1)
+}
+beta_coefficients <- c(beta_coefficients, rep(0, (ncol(otu.tab_selection) + 3)))
+xnam <- colnames(xdata)
+xformula <- as.formula(paste("~ ", paste(xnam, collapse= "+")))
+```
+**Generation of nomial multinomial outcomes:**
+```
+y <- nominal.simulated(betas=beta_coefficients, categories=categories, xformula = xformula, xdata = xdata) 
+```
+**Data synthesis of simulated data with nomial multinomial outcome:**
+```
+otu.tab_information <- otu_table(otu.tab, taxa_are_rows = FALSE)
+sample_information <- sample_data(as.data.frame(cbind(y, x1, x2)))
+colnames(sample_information) <- c("y", "x1", "x2")
+rownames(sample_information) <- rownames(otu.tab_information)
+biom <- phyloseq(otu.tab_information, tree, sample_information)
+```
+
+
+## 5.4. Function **sigma_value**
+
+### 5.4.1. Description
+
+The median value of distance matrix square (D * D) or distance matrix (D).
+
+
+### 5.4.2. Example
+
+```
+require(GUniFrac)
+require(multiMiAT)
+data(throat.otu.tab)
+data(throat.tree)
+unifs <- GUniFrac::GUniFrac(throat.otu.tab, throat.tree, alpha = c(0, 0.25, 0.5, 0.75, 1))$unifracs
+u.unif <- unifs[, , "d_UW"]
+sigma.u.unif.list <- sigma_value(u.unif)
+```
+
+
+## 5.5 Function **Kernel.Matrix**
+
+### 5.5.1 Description
+
+The function, **Kernel.Matrix**, establishes the kernel matrix through the kernel function (i.e., linear kernel, Gaussian kernel, exponential kernel and Laplacian kernel function).
+
+
+### 5.5.2 Example
+```
+require(GUniFrac)
+require(multiMiAT)
+data(throat.otu.tab)
+data(throat.tree)
+unifs <- GUniFrac::GUniFrac(throat.otu.tab, throat.tree, alpha = c(0, 0.25, 0.5, 0.75, 1))$unifracs
+u.unif <- unifs[, , "d_UW"]
+u.unif.k <- Kernel.Matrix(u.unif, kernel = c("LK", "GK", "EK", "LaK"), sigma.GK = 1, sigma.EK = 1, sigma.LaK = 1)
+```
+
+
+## 5.6. Function **Whole.Kernels**
+
+### 5.6.1. Description
+
+The construction of the kernel matrix through diverse distances (i.e., Jaccard dissimilarity, Bray-Curtis distance, Unifrac distance, Generalized UniFrac distance with $\alpha$ = 0, Generalized UniFrac distance with $\alpha$ = 0.25, Generalized UniFrac distance with $\alpha$ = 0.5, Generalized UniFrac distance with $\alpha$ = 0.75 and Weighted UniFrac distance) and kernel functions (i.e., linear kernel, Gaussian kernel, exponential kernel and Laplacian kernel function).
+
+
+### 5.6.2. Example
+```
+require(GUniFrac)
+require(ecodist)
+require(multiMiAT)
+data(throat.otu.tab)
+data(throat.tree)
+Ks <- Whole.Kernels(throat.otu.tab, throat.tree) 
+```
+
+
+## 5.7. Function **multiMiRKAT_bcl**
+
+### 5.7.1 Description
+
+The function, **multiMiRKAT_bcl**, can be used to detect the association between the microbiome and multinomial outcomes, which is microbiome regression-based kernel association tests based on baseline category logit model.
+
+
+### 5.7.2 Example
+
+**Import requisite R packages**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+```
+**Fit multiMiRKAT_bcl**
+```
+Ks <- Whole.Kernels(otu.tab, tree) 
+out <- multiMiRKAT_bcl(y = y, Ks = Ks, covs = covs)
+```
+
+
+## 5.8. Function **multiMiRKAT_clm**
+
+### 5.8.1 Description
+
+The function, **multiMiRKAT_clm**, can be used to detect the association between the microbiome and multinomial outcomes, which is microbiome regression-based kernel association tests based on cumulative link model.
+
+
+### 5.8.2 Example
+
+**Import requisite R packages**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+```
+**Fit multiMiRKAT_clm**
+```
+Ks <- Whole.Kernels(otu.tab, tree) 
+out <- multiMiRKAT_clm(y = y, Ks = Ks, covs = covs)
+```
+
+
+## 5.9. Function **multiMiRKAT_crm**
+
+### 5.9.1. Description
+
+The function, **multiMiRKAT_crm**, can be used to detect the association between the microbiome and multinomial outcomes, which is microbiome regression-based kernel association tests based on continuation ratio model.
+
+
+### 5.9.2. Example
+
+**Import requisite R packages**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+```
+**Fit multiMiRKAT_crm**
+```
+Ks <- Whole.Kernels(otu.tab, tree) 
+out <- multiMiRKAT_crm(y = y, Ks = Ks, covs = covs)
+```
+
+
+## 5.10. Function **score.test_bcl**
+
+### 5.10.1. Description
+
+The function, **score.test_bcl**, is score test based on baseline category logit model, which is a special case of an individual test in subtype analysis with somatic mutations (SASOM). It can be also used for the association between the microbiome and multinomial outcomes.
+
+
+### 5.10.2. Example
+
+**Import requisite R packages**
+```
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+W <- matrix(1, nrow = 1, ncol = ncol(otu.tab))
+```
+**Fit bcl-based score test**
+```
+out <- score.test_bcl(y, otu.tab, covs, W)
+```
+
+
+## 5.11. Function **MiRKAT_MCN**
+
+### 5.11.1. Description
+
+The function, **MiRKAT_MCN**, is MiRKAT_MC based on baseline category logit model, which mainly refers to the **MiRKATMC** function that sets "data.type" to "nominal" in R package, **MiRKATMC**. In addition, we fix a bug in the **MiRKATMC** function, i.e., the p-value combination method HMP reports an error When zero value appears in these combined p-values.
+
+
+### 5.11.2. Example
+**Import requisite R packages**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+```
+**Fit MiRKAT-MCN**
+```
+Ks <- Whole.Kernels(otu.tab, tree, distance = c("BC", "U.UniFrac", "G.UniFrac.00", "G.UniFrac.25", "G.UniFrac.50", "G.UniFrac.75", "W.UniFrac"), kernel = c("LK", "GK", "LaK"))
+out.MiRKAT_MCN <- MiRKAT_MCN(y = y, Ks = Ks, covs = covs)
+```
+
+
+## 5.12. Function **MiRKAT_MCO**
+
+### 5.12.1. Description
+The function, **MiRKAT_MCO**, is MiRKAT_MC based on cumulative link model, which mainly refers to the **MiRKATMC** function that sets "data.type" to "ordinal" in R package, **MiRKATMC**. In addition, we fix a bug in the **MiRKATMC** function, i.e., the p-value combination method HMP reports an error When zero value appears in these combined p-values.
+
+
+### 5.12.2. Example
+
+**Import requisite R packages**
+```
+require(ecodist)
+require(GUniFrac)
+require(phyloseq)
+require(VGAM)
+require(MASS)
+require(permute)
+require(ape)
+require(Matrix)
+require(multiMiAT)
+```
+**Import example microbiome data**
+```
+data(biom1)
+otu.tab <- otu_table(biom1)
+tree <- phy_tree(biom1)
+sample.data <- sample_data(biom1)
+y <- sample.data$DiseaseState
+y[which(y == "Health")] = 1
+y[which(y == "Adenoma")] = 2
+y[which(y == "Cancer")] = 3
+y <- as.factor(y)
+x1 <- sample.data$Age
+x2 <- sample.data$Race
+x2[which(x2 == "White")] <- 1
+x2[which(x2 == "Other")] <- 0
+x2 <- as.factor(x2)
+covs <- as.data.frame(cbind(x1, x2))
+colnames(covs) <- c("Age", "Race")
+covs[,1] <- as.numeric(covs[,1])
+covs[,2] <- as.factor(covs[,2])
+```
+**Fit MiRKAT-MCO**
+```
+Ks <- Whole.Kernels(otu.tab, tree, distance = c("BC", "U.UniFrac", "G.UniFrac.00", "G.UniFrac.25", "G.UniFrac.50", "G.UniFrac.75", "W.UniFrac"), kernel = c("LK", "GK", "LaK"))
+out.MiRKAT_MCO <- MiRKAT_MCO(y = y, Ks = Ks, covs = covs)
+```
+
+
+
+# 6. Dataset 
+
+biom1: Real data on colorectal cancer.
+
+biom2: Real data on _Clostridium difficile_ infections.
+
+phy.parameters: Estimated parameters of Dirichlet-multinomial distribution.
+
+
+
+# 7. References
+
+* Sun H, et al. multiMiAT: An optimal microbiome-based association test for multicategory phenotypes. (under review)
+
+* Agarwal D and Zhang NR. Semblance: Anempirical similarity kernel on probability spaces. _Science Advances_ 2019;**5**(12):eaau9630.
+
+* Agresti, A. Categorical data analysis (3rd ed). _Wiley_ 2013.
+
+* Bi W, et al. Efficient mixed model approach for large-scale genome-wide association studies of ordinal categorical phenotypes. _American Journal of Human Genetics_ 2021;**108**(5):825–839. 
+
+* Bray JR and Curtis JT. An ordination of the upland forest communities of southern Wisconsin. _Ecological Monographs_ 1957;**27**(4):325-349.
+
+* Chen J, et al. Associating microbiome composition with environmental covariates using generalized UniFrac distances. _Bioinformatics_ 2012;**28**(16):2106-2113.
+
+* Chen J and Li H. Variable selection for sparse Dirichlet-multinomial regression with an application to microbiome data analysis. _Annals of Applied Statistics_ 2013;**7**(1).
+
+* Jaccard P. The distribution of the flora in the alpine zone. _New Phytologist_ 1912;**11**(2):37-50.
+
+* Jiang Z, et al. MiRKAT-MC: A distance-based microbiome kernel association test with multi-categorical outcomes. _Frontiers in Genetics_ 2022;**13**:841764.
+
+* Koh H, et al. A powerful microbiome-based association test and a microbial taxa discovery framework for comprehensive association mapping. _Microbiome_ 2017;**5**(1):45.
+
+* Koh H, et al. A distance-based kernel association test based on the generalized linear mixed model for correlated microbiome studies. _Frontiers in Genetics_ 2019;**10**:458.
+
+* Liu M, et al. A method for subtype analysis with somatic mutations. _Bioinformatics_ 2021;**37**(1):50-56.
+
+* Lozupone C, et al. Quantitative and qualitative $\beta$ diversity measures lead to different insights into factors that structure microbial communities. _Applied and Environmental Microbiology_ 2007;**73**(5):1576-1585.
+
+* Lozupone CA and Knight R. UniFrac: a new phylogenetic method for comparing microbial communities. _Applied and Environmental Microbiology_ 2005;**73**(5):1576-1585.
+
+* McMurdie PJ and Holmes S. phyloseq: An R package for reproducible interactive analysis and graphics of microbiome census data. _PLoS ONE_. 2013;**8**(4):e61217.
+
+* Paradis E, et al. APE: Analyses of phylogenetics and evolution in R language. _Bioinformatics_ 2004;**20**(2):289-290.
+
+* Schubert AM, et al. Microbiome data distinguish patients with _Clostridium difficile_ infection and non-_C. difficile_-associated diarrhea from healthy controls. _mBio_ 2014;**5**(3):e01021–14.
+
+* Sun H, et al. Detecting sparse microbial association signals adaptively from longitudinal microbiome data based on generalized estimating equations. _Briefings in Bioinformatics_ 2022;**23**(5):bbac149.
+
+* Touloumis A. R package multgee: A generalized estimating equations solver for multinomial responses. _Journal of Statistical Software_ 2015;**64**(8):1-14.
+
+* Touloumis A. Simulating correlated binary and multinomial responses under marginal model specification: The SimCorMultRes Package. _The R Journal_ 2016,**8**(2):79.
+
+* Touloumis A, et al. GEE for multinomial responses using a local odds ratios parameterization. _Biom_ 2013,**69**(3):633–640.
+
+* Wilson DJ. The harmonic mean _p_-value for combining dependent tests. _Proceedings of the National Academy of Sciences_ 2019;**116**(4):1195–1200.
+
+* Wu C, et al. An adaptive association test for microbiome data. _Genome Medicine _ 2016;**8**(1):56.
+
+* Yee TW, et al. The VGAM package for categorical data analysis. _Journal of Statistical Software_ 2010;**32**(10).
+
+* Zackular JP, et al. The human gut microbiome as a screening tool for colorectal cancer. _Cancer Prevention Research_ 2014;**7**(11):1112–1121.
+
+* Zhan X, et al. A fast small‐sample kernel independence test for microbiome community‐level association analysis. _Biometrics_ 2017;**73**(4):1453-1463. 
+
+* Zhao N, et al. Testing in microbiome-profiling studies with MiRKAT, the microbiome regression-based kernel association test. _American Journal of Human Genetics_ 2015;**96**(5):797-807.
+
